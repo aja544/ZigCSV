@@ -4,17 +4,27 @@ const math = std.math;
 const mem = std.mem;
 const fs = std.fs;
 
+// CSVResult is now a top-level struct, making it more accessible
+pub const CSVResult = struct {
+    columns: [][][]const u8,
+    file_data: []const u8,
+
+    // Cleanup method for CSVResult
+    pub fn deinit(self: *CSVResult, allocator: Allocator) void {
+        for (self.columns) |col| {
+            allocator.free(col);
+        }
+        allocator.free(self.columns);
+        allocator.free(self.file_data);
+    }
+};
+
 pub const CSVLoader = struct {
     alloc: Allocator,
     filename: []const u8,
     n_columns: usize,
     delimiter: u8,
     num_threads: usize,
-
-    pub const CSVResult = struct {
-        columns: [][][]const u8,
-        file_data: []const u8,
-    };
 
     pub fn init(alloc: Allocator, filename: []const u8, delimiter: u8, num_threads: usize) !*CSVLoader {
         var self = try alloc.create(CSVLoader);
@@ -38,6 +48,8 @@ pub const CSVLoader = struct {
 
         // Read file and store in result for lifetime management
         const file_data = try self.alloc.alloc(u8, mapped_len);
+        errdefer self.alloc.free(file_data); // Clean up on error
+
         _ = try file.readAll(file_data);
 
         // Detect column count from first row
@@ -69,20 +81,20 @@ pub const CSVLoader = struct {
 
         // Allocate column storage
         var columns = try self.alloc.alloc([][]const u8, self.n_columns);
+        errdefer self.alloc.free(columns);
+
+        // Initialize columns array to track which ones are allocated
+        var allocated_columns: usize = 0;
         errdefer {
-            for (columns) |col| self.alloc.free(col);
-            self.alloc.free(columns);
+            // Only free the columns that were successfully allocated
+            for (columns[0..allocated_columns]) |col| {
+                self.alloc.free(col);
+            }
         }
 
         for (columns) |*col| {
             col.* = try self.alloc.alloc([]const u8, row_count);
-            errdefer {
-                for (columns[0..columns.len]) |c| {
-                    if (c.ptr == col.ptr) break;
-                    self.alloc.free(c);
-                }
-                self.alloc.free(columns);
-            }
+            allocated_columns += 1; // Track successful allocations
         }
 
         if (chunk.len == 0) return .{ .columns = columns };
@@ -195,23 +207,57 @@ fn countNewlinesSIMD(data: []const u8) usize {
     return count;
 }
 
+// Test with GeneralPurposeAllocator to detect leaks
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    // Use GPA for leak detection
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        const leaked = gpa.deinit();
+        if (leaked == .leak) {
+            std.debug.print("Memory leak detected!\n", .{});
+        }
+    }
+    const allocator = gpa.allocator();
+
     var timer = try std.time.Timer.start();
-    var loader = try CSVLoader.init(allocator, "data/test.csv", ',', 1);
+    var loader = try CSVLoader.init(allocator, "data/test_large_1m.csv", ',', 1);
     defer loader.deinit();
 
     const result = try loader.load();
     const elapsed_time = @as(f64, @floatFromInt(timer.read()));
-    std.debug.print("{} milli seconds.\n\n", .{elapsed_time / 1000000});
-    defer {
-        for (result.columns) |col| {
-            allocator.free(col);
-        }
-        allocator.free(result.columns);
-        allocator.free(result.file_data);
+    std.debug.print("Loading completed in {d} milli seconds.\n\n", .{elapsed_time / 1000000});
+
+    // Use the cleanup method - note that CSVResult is now a top-level type
+    var result_copy = result;
+    defer result_copy.deinit(allocator);
+
+    // Print all data
+    if (result.columns.len == 0) {
+        std.debug.print("No data loaded.\n", .{});
+        return;
     }
 
-    std.debug.print("First value: {s}\n", .{result.columns[0][0]});
-    std.debug.print("First value: {s}\n", .{result.columns[2][0]});
+    // const num_rows = result.columns[0].len;
+    // const num_cols = result.columns.len;
+
+    // std.debug.print("CSV Data ({d} rows, {d} columns):\n\n", .{ num_rows, num_cols });
+
+    // // Print all rows in simple format
+    // for (0..num_rows) |row| {
+    //     std.debug.print("Row {d}: ", .{row + 1});
+    //     for (0..num_cols) |col| {
+    //         const cell_value = if (row < result.columns[col].len)
+    //             result.columns[col][row]
+    //         else
+    //             "";
+    //         if (col == num_cols - 1) {
+    //             std.debug.print("'{s}'", .{cell_value});
+    //         } else {
+    //             std.debug.print("'{s}', ", .{cell_value});
+    //         }
+    //     }
+    //     std.debug.print("\n", .{});
+    // }
+
+    // std.debug.print("\nSummary: {d} rows × {d} columns\n", .{ num_rows, num_cols });
 }
