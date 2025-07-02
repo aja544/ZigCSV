@@ -198,7 +198,7 @@ fn countNewlinesSIMD(data: []const u8) usize {
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
     var timer = try std.time.Timer.start();
-    var loader = try CSVLoader.init(allocator, "data/test.csv", ',', 2);
+    var loader = try CSVLoader.init(allocator, "data/test.csv", ',', 1);
     defer loader.deinit();
 
     const result = try loader.load();
