@@ -3,10 +3,6 @@ const Allocator = std.mem.Allocator;
 const math = std.math;
 const mem = std.mem;
 const fs = std.fs;
-const posix = std.posix;
-const Thread = std.Thread;
-const Mutex = std.Thread.Mutex;
-const Condition = std.Thread.Condition;
 
 // CSVResult is now a top-level struct, making it more accessible
 pub const CSVResult = struct {
@@ -19,187 +15,47 @@ pub const CSVResult = struct {
             allocator.free(col);
         }
         allocator.free(self.columns);
-
-        // Unmap the memory-mapped file
-        posix.munmap(@alignCast(self.file_data));
+        allocator.free(self.file_data);
     }
 };
 
-// Thread pool for parallel processing
-pub const ThreadPool = struct {
-    const Self = @This();
-
-    const Task = struct {
-        func: *const fn (ctx: *anyopaque) void,
-        ctx: *anyopaque,
-    };
-
-    threads: []Thread,
-    tasks: std.ArrayList(Task),
-    mutex: Mutex,
-    condition: Condition,
-    shutdown: bool,
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator, num_threads: usize) !*Self {
-        const pool = try allocator.create(Self);
-        pool.* = Self{
-            .threads = try allocator.alloc(Thread, num_threads),
-            .tasks = std.ArrayList(Task).init(allocator),
-            .mutex = Mutex{},
-            .condition = Condition{},
-            .shutdown = false,
-            .allocator = allocator,
-        };
-
-        // Start worker threads
-        for (pool.threads, 0..) |*thread, i| {
-            thread.* = try Thread.spawn(.{}, workerThread, .{ pool, i });
-        }
-
-        return pool;
-    }
-
-    pub fn deinit(self: *Self) void {
-        // Signal shutdown
-        self.mutex.lock();
-        self.shutdown = true;
-        self.condition.broadcast();
-        self.mutex.unlock();
-
-        // Wait for all threads to finish
-        for (self.threads) |thread| {
-            thread.join();
-        }
-
-        self.allocator.free(self.threads);
-        self.tasks.deinit();
-        self.allocator.destroy(self);
-    }
-
-    pub fn submit(self: *Self, func: *const fn (ctx: *anyopaque) void, ctx: *anyopaque) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.shutdown) return error.PoolShutdown;
-
-        try self.tasks.append(.{ .func = func, .ctx = ctx });
-        self.condition.signal();
-    }
-
-    pub fn waitForCompletion(self: *Self) void {
-        while (true) {
-            self.mutex.lock();
-            const empty = self.tasks.items.len == 0;
-            self.mutex.unlock();
-
-            if (empty) break;
-            std.time.sleep(1000000); // 1ms
-        }
-
-        // Give a bit more time for tasks to complete
-        std.time.sleep(10000000); // 10ms
-    }
-
-    fn workerThread(self: *Self, thread_id: usize) void {
-        _ = thread_id;
-        while (true) {
-            self.mutex.lock();
-
-            // Wait for tasks or shutdown signal
-            while (self.tasks.items.len == 0 and !self.shutdown) {
-                self.condition.wait(&self.mutex);
-            }
-
-            if (self.shutdown) {
-                self.mutex.unlock();
-                break;
-            }
-
-            // Get a task
-            const task = self.tasks.swapRemove(0);
-            self.mutex.unlock();
-
-            // Execute the task
-            task.func(task.ctx);
-        }
-    }
+// Compact event structure for better cache efficiency
+const ParseEvent = packed struct(u64) {
+    pos: u32, // 32-bit position (supports files up to 4GB)
+    is_newline: u1, // 1-bit flag
+    _padding: u31, // Padding to align to 64-bit
 };
 
-// Memory mapping utilities
-const MmapUtils = struct {
-    const PAGE_SIZE = 4096; // Standard page size for most systems
-
-    // Cross-platform memory mapping
-    fn mmapFile(file: std.fs.File) ![]align(4096) const u8 {
-        const file_size = try file.getEndPos();
-        if (file_size == 0) return error.EmptyFile;
-
-        const mapped_len = math.cast(usize, file_size) orelse return error.FileTooBig;
-
-        // Get file descriptor
-        const fd = file.handle;
-
-        // Memory map the file with optimal flags
-        const mapped_memory = try posix.mmap(null, // addr: let OS choose address
-            mapped_len, // length: size of file
-            posix.PROT.READ, // prot: read-only access
-            .{ .TYPE = .PRIVATE }, // flags: private mapping
-            fd, // fd: file descriptor
-            0 // offset: start from beginning
-        );
-
-        return mapped_memory;
-    }
-
-    // Prefetch memory pages for better performance
-    fn prefetchPages(data: []const u8) void {
-        const page_size = PAGE_SIZE;
-        const pages = (data.len + page_size - 1) / page_size;
-
-        // Prefetch in chunks to avoid overwhelming the system
-        const prefetch_chunk = 64; // 64 pages at a time
-        var page: usize = 0;
-
-        while (page < pages) {
-            const chunk_end = @min(page + prefetch_chunk, pages);
-
-            // Touch each page to bring it into memory
-            while (page < chunk_end) : (page += 1) {
-                const offset = page * page_size;
-                if (offset < data.len) {
-                    // Volatile read to prevent optimization
-                    _ = @as(*volatile u8, @ptrCast(@constCast(&data[offset]))).*;
-                }
-            }
-
-            // Small delay to avoid overwhelming memory subsystem
-            if (page < pages) {
-                std.time.sleep(1000); // 1 microsecond
-            }
-        }
-    }
-
-    // Advise the kernel about memory access patterns
-    fn adviseSequentialAccess(data: []const u8) void {
-        // Use madvise to hint sequential access pattern
-        const ptr = @as([*]align(4096) u8, @ptrCast(@alignCast(@constCast(data.ptr))));
-        posix.madvise(ptr, data.len, posix.MADV.SEQUENTIAL) catch {};
-
-        // Also hint that we'll need the whole file
-        posix.madvise(ptr, data.len, posix.MADV.WILLNEED) catch {};
-    }
-};
-
-// Fast bit manipulation utilities with SIMD optimization
+// Fast bit manipulation utilities
 const BitUtils = struct {
-    // SIMD-optimized byte comparison
-    fn findBytesVectorized(data: []const u8, byte1: u8, byte2: u8, positions: *std.ArrayList(usize), newline_flags: *std.ArrayList(bool)) !void {
+    // Ultra-fast bit scanning using CPU intrinsics
+    inline fn extractAllSetBits(mask: u64) [64]u6 {
+        var positions: [64]u6 = undefined;
+        var count: u6 = 0;
+        var bits = mask;
+
+        // Unrolled bit extraction for maximum speed
+        comptime var i = 0;
+        inline while (i < 8) : (i += 1) {
+            if (bits != 0) {
+                const pos = @ctz(bits);
+                positions[count] = @intCast(pos);
+                count += 1;
+                bits &= bits - 1; // Clear lowest set bit
+            }
+        }
+
+        return positions;
+    }
+
+    // SIMD-optimized byte comparison with early termination
+    inline fn findBytesVectorized(data: []const u8, byte1: u8, byte2: u8, results: []ParseEvent) usize {
+        var count: usize = 0;
         const vector_size = 32; // Use 32-byte vectors for better performance
         const chunks = data.len / vector_size;
 
         var chunk_idx: usize = 0;
-        while (chunk_idx < chunks) {
+        while (chunk_idx < chunks and count < results.len - 64) {
             const base = chunk_idx * vector_size;
             const vec: @Vector(vector_size, u8) = data[base..][0..vector_size].*;
 
@@ -215,13 +71,17 @@ const BitUtils = struct {
 
             // Process both patterns simultaneously
             var combined_bits = bits1 | bits2;
-            while (combined_bits != 0) {
+            while (combined_bits != 0 and count < results.len) {
                 const bit_pos = @ctz(combined_bits);
                 const actual_pos = base + bit_pos;
-                const is_newline = (bits1 & (@as(u32, 1) << @intCast(bit_pos))) != 0;
 
-                try positions.append(actual_pos);
-                try newline_flags.append(is_newline);
+                results[count] = ParseEvent{
+                    .pos = @intCast(actual_pos),
+                    .is_newline = if ((bits1 & (@as(u32, 1) << @intCast(bit_pos))) != 0) 1 else 0,
+                    ._padding = 0,
+                };
+                count += 1;
+
                 combined_bits &= combined_bits - 1; // Clear lowest bit
             }
 
@@ -231,33 +91,17 @@ const BitUtils = struct {
         // Handle remainder
         const remainder_start = chunks * vector_size;
         for (data[remainder_start..], remainder_start..) |byte, pos| {
+            if (count >= results.len) break;
             if (byte == byte1) {
-                try positions.append(pos);
-                try newline_flags.append(true);
+                results[count] = ParseEvent{ .pos = @intCast(pos), .is_newline = 1, ._padding = 0 };
+                count += 1;
             } else if (byte == byte2) {
-                try positions.append(pos);
-                try newline_flags.append(false);
+                results[count] = ParseEvent{ .pos = @intCast(pos), .is_newline = 0, ._padding = 0 };
+                count += 1;
             }
         }
-    }
-};
 
-// Chunk processing task for parallel execution
-const ChunkTask = struct {
-    loader: *CSVLoader,
-    chunk_data: []const u8,
-    columns: [][][]const u8,
-    row_offset: usize,
-    result: *usize, // Store number of rows processed
-    mutex: *Mutex,
-
-    pub fn process(ctx: *anyopaque) void {
-        const task: *ChunkTask = @ptrCast(@alignCast(ctx));
-        const rows_processed = task.loader.processChunkOptimized(task.chunk_data, task.columns, task.row_offset) catch 0;
-
-        task.mutex.lock();
-        task.result.* = rows_processed;
-        task.mutex.unlock();
+        return count;
     }
 };
 
@@ -266,9 +110,10 @@ pub const CSVLoader = struct {
     filename: []const u8,
     n_columns: usize,
     delimiter: u8,
-    thread_pool: *ThreadPool,
+    num_threads: usize,
 
     // Pre-allocated buffers for reuse
+    event_buffer: []ParseEvent,
     field_buffer: [][]const u8,
 
     pub fn init(alloc: Allocator, filename: []const u8, delimiter: u8, num_threads: usize) !*CSVLoader {
@@ -276,17 +121,18 @@ pub const CSVLoader = struct {
         self.alloc = alloc;
         self.filename = filename;
         self.delimiter = delimiter;
+        self.num_threads = num_threads;
         self.n_columns = 0;
-        self.thread_pool = try ThreadPool.init(alloc, num_threads);
 
-        // Pre-allocate field buffer for better performance
+        // Pre-allocate buffers for better performance
+        self.event_buffer = try alloc.alloc(ParseEvent, 1024 * 1024); // 1M events
         self.field_buffer = try alloc.alloc([]const u8, 1024); // 1K fields per row
 
         return self;
     }
 
     pub fn deinit(self: *CSVLoader) void {
-        self.thread_pool.deinit();
+        self.alloc.free(self.event_buffer);
         self.alloc.free(self.field_buffer);
         self.alloc.destroy(self);
     }
@@ -294,23 +140,20 @@ pub const CSVLoader = struct {
     pub fn load(self: *CSVLoader) !CSVResult {
         const file = try fs.cwd().openFile(self.filename, .{});
         defer file.close();
+        const file_size = try file.getEndPos();
+        const mapped_len = math.cast(usize, file_size) orelse return error.FileTooBig;
 
-        // Memory map the file
-        const file_data = try MmapUtils.mmapFile(file);
+        // Read file and store in result for lifetime management
+        const file_data = try self.alloc.alloc(u8, mapped_len);
+        errdefer self.alloc.free(file_data);
 
-        // Optimize memory access patterns
-        MmapUtils.adviseSequentialAccess(file_data);
-
-        // Prefetch pages in background for better performance
-        MmapUtils.prefetchPages(file_data);
-
-        std.debug.print("Successfully memory-mapped file: {d} bytes\n", .{file_data.len});
+        _ = try file.readAll(file_data);
 
         // Detect column count from first row
         self.n_columns = try self.detectColumnCount(file_data);
 
-        // Process file data with parallel chunking
-        const result = try self.processWithParallelChunking(file_data);
+        // Process file data with ultra-optimized version
+        const result = try self.processChunkUltraFast(file_data, true);
         return .{ .columns = result.columns, .file_data = file_data };
     }
 
@@ -399,21 +242,15 @@ pub const CSVLoader = struct {
         }
     }
 
-    // FIXED: Added missing estimateRowsInChunk method
-    fn estimateRowsInChunk(self: *CSVLoader, chunk_data: []const u8) usize {
-        _ = self;
-        // Simple estimation based on newline count
-        return countNewlinesSIMDOptimized(chunk_data);
-    }
+    // Ultra-optimized chunk processing with minimal overhead
+    fn processChunkUltraFast(self: *CSVLoader, chunk: []const u8, is_last_chunk: bool) !struct { columns: [][][]const u8 } {
+        const newline_count = countNewlinesSIMDOptimized(chunk);
+        const row_count = if (chunk.len == 0) 0 else if (is_last_chunk and chunk[chunk.len - 1] != '\n')
+            newline_count + 1
+        else
+            newline_count;
 
-    // New method using parallel chunking
-    fn processWithParallelChunking(self: *CSVLoader, data: []const u8) !struct { columns: [][][]const u8 } {
-        // First pass: count total rows using SIMD
-        const total_rows = self.countTotalRows(data);
-
-        std.debug.print("Total rows detected: {d}\n", .{total_rows});
-
-        // Allocate column storage
+        // Allocate column storage with better memory alignment
         var columns = try self.alloc.alloc([][]const u8, self.n_columns);
         errdefer self.alloc.free(columns);
 
@@ -426,161 +263,69 @@ pub const CSVLoader = struct {
 
         // Allocate all columns at once for better memory locality
         for (columns) |*col| {
-            col.* = try self.alloc.alloc([]const u8, total_rows);
+            col.* = try self.alloc.alloc([]const u8, row_count);
             allocated_columns += 1;
         }
 
-        if (data.len == 0) return .{ .columns = columns };
+        if (chunk.len == 0) return .{ .columns = columns };
 
-        // For smaller files, process sequentially to avoid overhead
-        if (data.len < 10 * 1024 * 1024) { // Less than 10MB
-            _ = try self.processChunkOptimized(data, columns, 0);
-            return .{ .columns = columns };
-        }
-
-        // Process data in parallel chunks for large files
-        const num_threads = self.thread_pool.threads.len;
-        const chunk_size = @max(1024 * 1024, data.len / num_threads); // At least 1MB per chunk
-
-        var data_offset: usize = 0;
-        var chunk_tasks = std.ArrayList(ChunkTask).init(self.alloc);
-        defer chunk_tasks.deinit();
-
-        var chunk_results = std.ArrayList(usize).init(self.alloc);
-        defer chunk_results.deinit();
-
-        var chunk_mutex = Mutex{};
-        var current_row_offset: usize = 0;
-
-        // Create chunks and submit to thread pool
-        while (data_offset < data.len) {
-            const chunk_end = @min(data_offset + chunk_size, data.len);
-
-            // Find a safe chunk boundary (end at newline)
-            var safe_end = chunk_end;
-            if (chunk_end < data.len) {
-                // Find the last newline in the chunk
-                while (safe_end > data_offset and data[safe_end - 1] != '\n') {
-                    safe_end -= 1;
-                }
-
-                // If no newline found, extend to find one
-                if (safe_end == data_offset) {
-                    safe_end = chunk_end;
-                    while (safe_end < data.len and data[safe_end] != '\n') {
-                        safe_end += 1;
-                    }
-                    if (safe_end < data.len) safe_end += 1; // Include the newline
-                }
-            }
-
-            const chunk_data = data[data_offset..safe_end];
-
-            // Create task for this chunk
-            try chunk_results.append(0);
-            const result_ptr = &chunk_results.items[chunk_results.items.len - 1];
-
-            const task = ChunkTask{
-                .loader = self,
-                .chunk_data = chunk_data,
-                .columns = columns,
-                .row_offset = current_row_offset,
-                .result = result_ptr,
-                .mutex = &chunk_mutex,
-            };
-
-            try chunk_tasks.append(task);
-
-            // Submit task to thread pool
-            try self.thread_pool.submit(ChunkTask.process, &chunk_tasks.items[chunk_tasks.items.len - 1]);
-
-            // Update counters for next chunk
-            const estimated_rows = self.estimateRowsInChunk(chunk_data);
-            current_row_offset += estimated_rows;
-            data_offset = safe_end;
-        }
-
-        // Wait for all tasks to complete
-        self.thread_pool.waitForCompletion();
-
-        // Sum up actual results
-        var actual_total_rows: usize = 0;
-        for (chunk_results.items) |rows| {
-            actual_total_rows += rows;
-        }
-
-        std.debug.print("Processed {d} chunks with {d} total rows\n", .{ chunk_tasks.items.len, actual_total_rows });
-
-        return .{ .columns = columns };
-    }
-
-    // Count total rows using SIMD optimization
-    fn countTotalRows(self: *CSVLoader, data: []const u8) usize {
-        _ = self;
-        return countNewlinesSIMDOptimized(data);
-    }
-
-    // Process a single chunk with SIMD optimization
-    fn processChunkOptimized(self: *CSVLoader, chunk: []const u8, columns: [][][]const u8, row_offset: usize) !usize {
-        if (chunk.len == 0) return 0;
-
-        // Find all delimiters and newlines using SIMD
-        var positions = std.ArrayList(usize).init(self.alloc);
-        defer positions.deinit();
-
-        var newline_flags = std.ArrayList(bool).init(self.alloc);
-        defer newline_flags.deinit();
-
-        try BitUtils.findBytesVectorized(chunk, '\n', self.delimiter, &positions, &newline_flags);
+        // Ultra-fast event finding
+        const event_count = BitUtils.findBytesVectorized(chunk, '\n', self.delimiter, self.event_buffer);
 
         // Process events with zero-copy field extraction
         var field_start: usize = 0;
         var current_row: usize = 0;
         var field_count: usize = 0;
 
-        // Process events efficiently
-        for (positions.items, newline_flags.items) |pos, is_newline| {
-            if (is_newline) {
-                // Add final field
-                if (field_count < self.field_buffer.len) {
-                    self.field_buffer[field_count] = chunk[field_start..pos];
-                    field_count += 1;
+        // Process events in batches for better cache performance
+        const batch_size = 64; // Process 64 events at once
+        var event_idx: usize = 0;
+
+        while (event_idx < event_count) {
+            const batch_end = @min(event_idx + batch_size, event_count);
+
+            // Process current batch
+            while (event_idx < batch_end and current_row < row_count) {
+                const event = self.event_buffer[event_idx];
+                const pos: usize = event.pos;
+
+                if (event.is_newline == 1) {
+                    // Add final field
+                    if (field_count < self.field_buffer.len) {
+                        self.field_buffer[field_count] = chunk[field_start..pos];
+                        field_count += 1;
+                    }
+
+                    // Assign all fields for this row using optimized dispatcher
+                    self.assignFieldsDispatch(columns, self.field_buffer[0..field_count], current_row);
+
+                    // Reset for next row
+                    current_row += 1;
+                    field_count = 0;
+                    field_start = pos + 1;
+                } else {
+                    // Add field to buffer
+                    if (field_count < self.field_buffer.len) {
+                        self.field_buffer[field_count] = chunk[field_start..pos];
+                        field_count += 1;
+                    }
+                    field_start = pos + 1;
                 }
 
-                // Assign all fields for this row using optimized dispatcher
-                const actual_row = row_offset + current_row;
-                if (actual_row < columns[0].len) {
-                    self.assignFieldsDispatch(columns, self.field_buffer[0..field_count], actual_row);
-                }
-
-                // Reset for next row
-                current_row += 1;
-                field_count = 0;
-                field_start = pos + 1;
-            } else {
-                // Add field to buffer
-                if (field_count < self.field_buffer.len) {
-                    self.field_buffer[field_count] = chunk[field_start..pos];
-                    field_count += 1;
-                }
-                field_start = pos + 1;
+                event_idx += 1;
             }
         }
 
-        // Handle final row if no trailing newline
-        if (field_start < chunk.len) {
+        // Handle final row
+        if (field_start < chunk.len and current_row < row_count) {
             if (field_count < self.field_buffer.len) {
                 self.field_buffer[field_count] = chunk[field_start..];
                 field_count += 1;
             }
-            const actual_row = row_offset + current_row;
-            if (actual_row < columns[0].len) {
-                self.assignFieldsDispatch(columns, self.field_buffer[0..field_count], actual_row);
-            }
-            current_row += 1;
+            self.assignFieldsDispatch(columns, self.field_buffer[0..field_count], current_row);
         }
 
-        return current_row;
+        return .{ .columns = columns };
     }
 };
 
@@ -649,19 +394,17 @@ pub fn main() !void {
     }
     const allocator = gpa.allocator();
 
-    const filename = "data/test.csv";
-    const num_threads = 4; // Adjust based on your CPU cores
-
-    // Main execution with memory mapping and parallel processing
     var timer = try std.time.Timer.start();
-    var loader = try CSVLoader.init(allocator, filename, ',', num_threads);
+    var loader = try CSVLoader.init(allocator, "data/sample.csv", ',', 1);
     defer loader.deinit();
 
-    var result = try loader.load();
+    const result = try loader.load();
     const elapsed_time = @as(f64, @floatFromInt(timer.read()));
+    std.debug.print("Loading completed in {d} milli seconds.\n\n", .{elapsed_time / 1000000});
 
-    // Use the cleanup method - CSVResult handles mmap cleanup
-    defer result.deinit(allocator);
+    // Use the cleanup method - note that CSVResult is now a top-level type
+    var result_copy = result;
+    defer result_copy.deinit(allocator);
 
     // Print all data
     if (result.columns.len == 0) {
@@ -672,10 +415,10 @@ pub fn main() !void {
     const num_rows = result.columns[0].len;
     const num_cols = result.columns.len;
 
-    std.debug.print("CSV Data ({d} rows, {d} columns) - Memory mapped with parallel processing\n\n", .{ num_rows, num_cols });
+    std.debug.print("CSV Data ({d} rows, {d} columns):\n\n", .{ num_rows, num_cols });
 
     // Print first few rows as sample
-    const sample_rows = @min(5, num_rows); // Show max 10 rows
+    const sample_rows = @min(5, num_rows);
     for (0..sample_rows) |row| {
         std.debug.print("Row {d}: ", .{row + 1});
         for (0..num_cols) |col| {
@@ -684,9 +427,9 @@ pub fn main() !void {
             else
                 "";
             if (col == num_cols - 1) {
-                std.debug.print("{s}", .{cell_value});
+                std.debug.print("'{s}'", .{cell_value});
             } else {
-                std.debug.print("{s}, ", .{cell_value});
+                std.debug.print("'{s}', ", .{cell_value});
             }
         }
         std.debug.print("\n", .{});
@@ -696,6 +439,6 @@ pub fn main() !void {
         std.debug.print("... ({d} more rows)\n", .{num_rows - sample_rows});
     }
 
-    std.debug.print("\nSummary: {d} rows × {d} columns processed with {d} threads\n", .{ num_rows, num_cols, num_threads });
-    std.debug.print("\nLoading completed in {d:.2} milliseconds.\n", .{elapsed_time / 1000000});
+    std.debug.print("\nSummary: {d} rows × {d} columns\n", .{ num_rows, num_cols });
 }
+// probabl the best..
